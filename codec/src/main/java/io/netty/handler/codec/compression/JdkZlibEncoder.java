@@ -24,7 +24,9 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.ChannelPromiseNotifier;
 import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.internal.PlatformDependent;
 
+import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32;
 import java.util.zip.Deflater;
@@ -196,16 +198,23 @@ public class JdkZlibEncoder extends ZlibEncoder {
 
         int offset;
         byte[] inAry;
+        ByteBuffer directBuf;
         if (uncompressed.hasArray()) {
             // if it is backed by an array we not need to to do a copy at all
             inAry = uncompressed.array();
             offset = uncompressed.arrayOffset() + uncompressed.readerIndex();
             // skip all bytes as we will consume all of them
             uncompressed.skipBytes(len);
+            directBuf = null;
+        } else if (uncompressed.isDirect() && PlatformDependent.directBufferPreferred()) {
+            inAry = null;
+            offset = 0;
+            directBuf = uncompressed.nioBuffer();
         } else {
             inAry = new byte[len];
             uncompressed.readBytes(inAry);
             offset = 0;
+            directBuf = null;
         }
 
         if (writeHeader) {
@@ -216,28 +225,37 @@ public class JdkZlibEncoder extends ZlibEncoder {
         }
 
         if (wrapper == ZlibWrapper.GZIP) {
-            crc.update(inAry, offset, len);
+            if (directBuf == null) {
+                crc.update(inAry, offset, len);
+            } else {
+                crc.update(directBuf);
+            }
         }
 
-        deflater.setInput(inAry, offset, len);
-        for (;;) {
-            deflate(out);
-            if (deflater.needsInput()) {
-                // Consumed everything
-                break;
-            } else {
+        if (directBuf == null) {
+            deflater.setInput(inAry, offset, len);
+            deflateHeapBuf(out);
+            while (!deflater.needsInput()) {
                 if (!out.isWritable()) {
-                    // We did not consume everything but the buffer is not writable anymore. Increase the capacity to
-                    // make more room.
                     out.ensureWritable(out.writerIndex());
                 }
+                deflateHeapBuf(out);
+            }
+        } else {
+            deflater.setInput(directBuf);
+            deflateDirectBuf(out);
+            while (!deflater.needsInput()) {
+                if (!out.isWritable()) {
+                    out.ensureWritable(out.writerIndex());
+                }
+                deflateDirectBuf(out);
             }
         }
     }
 
     @Override
     protected final ByteBuf allocateBuffer(ChannelHandlerContext ctx, ByteBuf msg,
-                                           boolean preferDirect) throws Exception {
+                                           boolean preferDirect) {
         int sizeEstimate = (int) Math.ceil(msg.readableBytes() * 1.001) + 12;
         if (writeHeader) {
             switch (wrapper) {
@@ -251,7 +269,9 @@ public class JdkZlibEncoder extends ZlibEncoder {
                     // no op
             }
         }
-        return ctx.alloc().heapBuffer(sizeEstimate);
+        return PlatformDependent.directBufferPreferred()
+            ? ctx.alloc().directBuffer(sizeEstimate)
+            : ctx.alloc().heapBuffer(sizeEstimate);
     }
 
     @Override
@@ -274,7 +294,9 @@ public class JdkZlibEncoder extends ZlibEncoder {
         }
 
         finished = true;
-        ByteBuf footer = ctx.alloc().heapBuffer();
+        ByteBuf footer = PlatformDependent.directBufferPreferred()
+            ? ctx.alloc().directBuffer()
+            : ctx.alloc().heapBuffer();
         if (writeHeader && wrapper == ZlibWrapper.GZIP) {
             // Write the GZIP header first if not written yet. (i.e. user wrote nothing.)
             writeHeader = false;
@@ -283,13 +305,10 @@ public class JdkZlibEncoder extends ZlibEncoder {
 
         deflater.finish();
 
-        while (!deflater.finished()) {
-            deflate(footer);
-            if (!footer.isWritable()) {
-                // no more space so write it to the channel and continue
-                ctx.write(footer);
-                footer = ctx.alloc().heapBuffer();
-            }
+        if (footer.isDirect()) {
+            footer = deflateDirectBufLoop(ctx, footer);
+        } else {
+            footer = deflateHeapBufLoop(ctx, footer);
         }
         if (wrapper == ZlibWrapper.GZIP) {
             int crcValue = (int) crc.getValue();
@@ -307,12 +326,45 @@ public class JdkZlibEncoder extends ZlibEncoder {
         return ctx.writeAndFlush(footer, promise);
     }
 
-    private void deflate(ByteBuf out) {
+    private ByteBuf deflateHeapBufLoop(final ChannelHandlerContext ctx, ByteBuf footer) {
+        while (!deflater.finished()) {
+            deflateHeapBuf(footer);
+            if (!footer.isWritable()) {
+                // no more space so write it to the channel and continue
+                ctx.write(footer);
+                footer = ctx.alloc().heapBuffer();
+            }
+        }
+        return footer;
+    }
+
+    private void deflateHeapBuf(ByteBuf out) {
         int numBytes;
         do {
             int writerIndex = out.writerIndex();
             numBytes = deflater.deflate(
-                    out.array(), out.arrayOffset() + writerIndex, out.writableBytes(), Deflater.SYNC_FLUSH);
+                out.array(), out.arrayOffset() + writerIndex, out.writableBytes(), Deflater.SYNC_FLUSH);
+            out.writerIndex(writerIndex + numBytes);
+        } while (numBytes > 0);
+    }
+
+    private ByteBuf deflateDirectBufLoop(final ChannelHandlerContext ctx, ByteBuf footer) {
+        while (!deflater.finished()) {
+            deflateDirectBuf(footer);
+            if (!footer.isWritable()) {
+                // no more space so write it to the channel and continue
+                ctx.write(footer);
+                footer = ctx.alloc().directBuffer();
+            }
+        }
+        return footer;
+    }
+
+    private void deflateDirectBuf(ByteBuf out) {
+        int numBytes;
+        do {
+            int writerIndex = out.writerIndex();
+            numBytes = deflater.deflate(out.nioBuffer(), Deflater.SYNC_FLUSH);
             out.writerIndex(writerIndex + numBytes);
         } while (numBytes > 0);
     }

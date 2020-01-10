@@ -19,6 +19,7 @@ import static java.util.Objects.requireNonNull;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.util.internal.PlatformDependent;
 
 import java.util.zip.CRC32;
 import java.util.zip.DataFormatException;
@@ -170,50 +171,24 @@ public class JdkZlibDecoder extends ZlibDecoder {
 
         if (in.hasArray()) {
             inflater.setInput(in.array(), in.arrayOffset() + in.readerIndex(), readableBytes);
+        } else if (in.isDirect() && PlatformDependent.directBufferPreferred()) {
+            inflater.setInput(in.nioBuffer());
         } else {
             byte[] array = new byte[readableBytes];
             in.getBytes(in.readerIndex(), array);
             inflater.setInput(array);
         }
 
-        ByteBuf decompressed = ctx.alloc().heapBuffer(inflater.getRemaining() << 1);
+        ByteBuf decompressed = PlatformDependent.directBufferPreferred()
+            ? ctx.alloc().directBuffer(inflater.getRemaining() << 1)
+            : ctx.alloc().heapBuffer(inflater.getRemaining() << 1);
         try {
-            boolean readFooter = false;
-            while (!inflater.needsInput()) {
-                byte[] outArray = decompressed.array();
-                int writerIndex = decompressed.writerIndex();
-                int outIndex = decompressed.arrayOffset() + writerIndex;
-                int outputLength = inflater.inflate(outArray, outIndex, decompressed.writableBytes());
-                if (outputLength > 0) {
-                    decompressed.writerIndex(writerIndex + outputLength);
-                    if (crc != null) {
-                        crc.update(outArray, outIndex, outputLength);
-                    }
-                } else {
-                    if (inflater.needsDictionary()) {
-                        if (dictionary == null) {
-                            throw new DecompressionException(
-                                    "decompression failure, unable to set dictionary as non was specified");
-                        }
-                        inflater.setDictionary(dictionary);
-                    }
-                }
-
-                if (inflater.finished()) {
-                    if (crc == null) {
-                        finished = true; // Do not decode anymore.
-                    } else {
-                        readFooter = true;
-                    }
-                    break;
-                } else {
-                    decompressed.ensureWritable(inflater.getRemaining() << 1);
-                }
-            }
-
+            boolean readFooter = decompressed.isDirect()
+                ? inflateDirectBuf(decompressed)
+                : inflateHeapBuf(decompressed);
             in.skipBytes(readableBytes - inflater.getRemaining());
 
-            if (readFooter) {
+            if (readFooter) { // true only when crc is not null
                 gzipState = GzipState.FOOTER_START;
                 if (readGZIPFooter(in)) {
                     finished = !decompressConcatenated;
@@ -235,6 +210,76 @@ public class JdkZlibDecoder extends ZlibDecoder {
                 decompressed.release();
             }
         }
+    }
+
+    private boolean inflateHeapBuf(ByteBuf decompressed) throws DataFormatException {
+        boolean readFooter = false;
+        while (!inflater.needsInput()) {
+            byte[] outArray = decompressed.array();
+            int writerIndex = decompressed.writerIndex();
+            int outIndex = decompressed.arrayOffset() + writerIndex;
+            int outputLength = inflater.inflate(outArray, outIndex, decompressed.writableBytes());
+            if (outputLength > 0) {
+                decompressed.writerIndex(writerIndex + outputLength);
+                if (crc != null) {
+                    crc.update(outArray, outIndex, outputLength);
+                }
+            } else {
+                if (inflater.needsDictionary()) {
+                    if (dictionary == null) {
+                        throw new DecompressionException(
+                            "decompression failure, unable to set dictionary as non was specified");
+                    }
+                    inflater.setDictionary(dictionary);
+                }
+            }
+
+            if (inflater.finished()) {
+                if (crc == null) {
+                    finished = true; // Do not decode anymore.
+                } else {
+                    readFooter = true;
+                }
+                break;
+            } else {
+                decompressed.ensureWritable(inflater.getRemaining() << 1);
+            }
+        }
+        return readFooter;
+    }
+
+    private boolean inflateDirectBuf(ByteBuf decompressed) throws DataFormatException {
+        boolean readFooter = false;
+        while (!inflater.needsInput()) {
+            int writerIndex = decompressed.writerIndex();
+            int outputLength = inflater.inflate(decompressed.nioBuffer());
+            if (outputLength > 0) {
+                decompressed.writerIndex(writerIndex + outputLength);
+                if (crc != null) {
+                    crc.update(decompressed, writerIndex, outputLength);
+                }
+            } else {
+                if (inflater.needsDictionary()) {
+                    if (dictionary == null) {
+                        throw new DecompressionException(
+                            "decompression failure, unable to set dictionary as non was specified");
+                    }
+                    inflater.setDictionary(dictionary);
+                }
+            }
+
+            if (inflater.finished()) {
+                if (crc == null) {
+                    finished = true; // Do not decode anymore.
+                } else {
+                    readFooter = true;
+                }
+                break;
+            } else {
+                decompressed.ensureWritable(inflater.getRemaining() << 1);
+            }
+        }
+        return readFooter;
     }
 
     @Override
